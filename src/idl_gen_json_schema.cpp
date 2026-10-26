@@ -205,7 +205,8 @@ static std::string GenPrimitiveTypes(int indent = 0) {
          indentStr + "\"long\": { " + GenType(BASE_TYPE_LONG) + " },\n" +
          indentStr + "\"ulong\": { " + GenType(BASE_TYPE_ULONG) + " },\n" +
          indentStr + "\"float\": { " + GenType(BASE_TYPE_FLOAT) + " },\n" +
-         indentStr + "\"double\": { " + GenType(BASE_TYPE_DOUBLE) + " },";
+         indentStr + "\"double\": { " + GenType(BASE_TYPE_DOUBLE) + " },\n" +
+         indentStr + "\"string\": { " + GenType("string") + " },";
 }
 #endif
 
