@@ -4693,6 +4693,9 @@ bool Parser::LookupDynamicType(std::string const & typeName, Type & type)
   {
     if (LookupDynamicType(std::string(typeName.begin() + 1, typeName.end() - 1), type))
     {
+      // FlatBuffers has no vectors of vectors: a Type keeps only its element's base type.
+      if (type.base_type == BASE_TYPE_VECTOR)
+        return false;
       type.element = type.base_type;
       type.base_type = BASE_TYPE_VECTOR;
       return true;
