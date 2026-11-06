@@ -341,8 +341,13 @@ struct JsonPrinter {
         return "type not found";
       }
 
-      auto typeName = table->GetPointer<String*>(typeNameFieldDef->value.offset)->c_str();
-      if (nosParser->ResolveDynamicType(typeName, &fd, type))
+      auto typeName = table->GetPointer<const String *>(typeNameFieldDef->value.offset);
+      // The type name is optional: without it the value stays the bytes it is.
+      if (!typeName)
+      {
+        return PrintOffset(val, fd.value.type, indent, prev_val, -1);
+      }
+      if (nosParser->ResolveDynamicType(typeName->c_str(), &fd, type))
       {
         auto data = table->GetPointer<const Vector<uint8_t> *>(fd.value.offset);
 
