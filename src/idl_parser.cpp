@@ -3556,7 +3556,13 @@ bool Parser::Parse(const char *source, const char **include_paths,
   if (opts.use_flexbuffers) {
     r = ParseFlexBuffer(source, source_filename, &flex_builder_);
   } else {
+#if defined(NOS_CUSTOM_FLATBUFFERS) && NOS_CUSTOM_FLATBUFFERS
+    const auto checkpoint = MakeCheckpoint();
+#endif
     r = !ParseRoot(source, include_paths, source_filename).Check();
+#if defined(NOS_CUSTOM_FLATBUFFERS) && NOS_CUSTOM_FLATBUFFERS
+    if (!r) RollBack(checkpoint);
+#endif
   }
   FLATBUFFERS_ASSERT(initial_depth == parse_depth_counter_);
   return r;
@@ -3801,6 +3807,9 @@ CheckedError Parser::DoParse(const char *source, const char **include_paths,
     if (included_files_.find(source_hash) == included_files_.end()) {
       included_files_[source_hash] = include_filename ? include_filename : "";
       files_included_per_file_[source_filename] = std::set<IncludedFile>();
+#if defined(NOS_CUSTOM_FLATBUFFERS) && NOS_CUSTOM_FLATBUFFERS
+      file_hashes_[source_filename] = source_hash;
+#endif
     } else {
       return NoError();
     }
@@ -4988,6 +4997,171 @@ bool Parser::CompleteMissingField(FieldDef* absent_field, const StructDef &struc
   }
 
   return found;
+}
+
+static std::string QualifiedName(const Definition &def) {
+  return def.defined_namespace
+             ? def.defined_namespace->GetFullyQualifiedName(def.name)
+             : def.name;
+}
+
+static std::string QualifiedName(const Type &type) {
+  if (type.struct_def) return QualifiedName(*type.struct_def);
+  if (type.enum_def) return QualifiedName(*type.enum_def);
+  return "";
+}
+
+// Deletes what a failed parse added after the first size entries. A struct the
+// parse declared early can have taken the name of an older one in the
+// dictionary, so the older entries get their names back.
+template<typename T>
+static void RollBackSymbolTable(SymbolTable<T> &table, size_t size) {
+  FLATBUFFERS_ASSERT(size <= table.vec.size());
+  const std::set<T *> added(table.vec.begin() + size, table.vec.end());
+  for (auto it = table.dict.begin(); it != table.dict.end();) {
+    if (added.count(it->second))
+      it = table.dict.erase(it);
+    else
+      ++it;
+  }
+  for (auto *def : added) delete def;
+  table.vec.resize(size);
+  for (auto *def : table.vec) table.dict.emplace(QualifiedName(*def), def);
+}
+
+template<typename T, typename F>
+static void EraseFromSymbolTable(SymbolTable<T> &table, F erase) {
+  for (auto it = table.dict.begin(); it != table.dict.end();) {
+    if (erase(*it->second))
+      it = table.dict.erase(it);
+    else
+      ++it;
+  }
+  std::vector<T *> kept;
+  for (auto *def : table.vec) {
+    if (erase(*def))
+      delete def;
+    else
+      kept.push_back(def);
+  }
+  table.vec.swap(kept);
+}
+
+static bool UsesAny(const Type &type, const std::set<const Definition *> &defs) {
+  return (type.struct_def && defs.count(type.struct_def)) ||
+         (type.enum_def && defs.count(type.enum_def));
+}
+
+Parser::DefinitionCheckpoint Parser::MakeCheckpoint() const {
+  DefinitionCheckpoint checkpoint;
+  checkpoint.types = types_.vec.size();
+  checkpoint.structs = structs_.vec.size();
+  checkpoint.enums = enums_.vec.size();
+  checkpoint.services = services_.vec.size();
+  checkpoint.namespaces = namespaces_.size();
+  checkpoint.native_included_files = native_included_files_.size();
+  checkpoint.current_namespace = current_namespace_;
+  checkpoint.root_struct_def = root_struct_def_;
+  checkpoint.file_identifier = file_identifier_;
+  checkpoint.file_extension = file_extension_;
+  checkpoint.included_files = included_files_;
+  checkpoint.files_included_per_file = files_included_per_file_;
+  checkpoint.file_hashes = file_hashes_;
+  checkpoint.known_attributes = known_attributes_;
+  checkpoint.advanced_features = advanced_features_;
+  checkpoint.uses_flexbuffers = uses_flexbuffers_;
+  return checkpoint;
+}
+
+void Parser::RollBack(const DefinitionCheckpoint &checkpoint) {
+  // Types name the structs and enums, so they go first.
+  RollBackSymbolTable(types_, checkpoint.types);
+  RollBackSymbolTable(structs_, checkpoint.structs);
+  RollBackSymbolTable(enums_, checkpoint.enums);
+  RollBackSymbolTable(services_, checkpoint.services);
+  for (auto it = namespaces_.begin() + checkpoint.namespaces;
+       it != namespaces_.end(); ++it) {
+    delete *it;
+  }
+  namespaces_.resize(checkpoint.namespaces);
+  native_included_files_.resize(checkpoint.native_included_files);
+  current_namespace_ = checkpoint.current_namespace;
+  root_struct_def_ = checkpoint.root_struct_def;
+  file_identifier_ = checkpoint.file_identifier;
+  file_extension_ = checkpoint.file_extension;
+  included_files_ = checkpoint.included_files;
+  files_included_per_file_ = checkpoint.files_included_per_file;
+  file_hashes_ = checkpoint.file_hashes;
+  known_attributes_ = checkpoint.known_attributes;
+  advanced_features_ = checkpoint.advanced_features;
+  uses_flexbuffers_ = checkpoint.uses_flexbuffers;
+}
+
+std::set<std::string> Parser::FindDependentSchemaFiles(
+    const std::set<std::string> &files) const {
+  std::set<std::string> leaving = files;
+  std::set<std::string> dependents;
+  // A dependent file takes its own dependents with it, so this goes on until a
+  // round finds no new file.
+  for (bool found = true; found;) {
+    found = false;
+    std::set<const Definition *> gone;
+    for (auto *def : structs_.vec)
+      if (leaving.count(def->file)) gone.insert(def);
+    for (auto *def : enums_.vec)
+      if (leaving.count(def->file)) gone.insert(def);
+    const auto depends = [&](const Definition &def) {
+      if (leaving.count(def.file) || !dependents.insert(def.file).second)
+        return;
+      found = true;
+    };
+    for (auto *def : structs_.vec) {
+      for (auto *field : def->fields.vec) {
+        if (UsesAny(field->value.type, gone) ||
+            (field->nested_flatbuffer && gone.count(field->nested_flatbuffer)))
+          depends(*def);
+      }
+    }
+    for (auto *def : enums_.vec) {
+      for (auto *val : def->Vals()) {
+        if (UsesAny(val->union_type, gone)) depends(*def);
+      }
+    }
+    for (auto *def : services_.vec) {
+      for (auto *call : def->calls.vec) {
+        if (gone.count(call->request) || gone.count(call->response))
+          depends(*def);
+      }
+    }
+    leaving.insert(dependents.begin(), dependents.end());
+  }
+  return dependents;
+}
+
+bool Parser::RemoveSchemaFiles(const std::set<std::string> &files) {
+  if (!FindDependentSchemaFiles(files).empty()) return false;
+  const auto declared = [&](const Definition *def) {
+    return def && files.count(def->file) != 0;
+  };
+  // Types name the structs and enums, so they go first.
+  EraseFromSymbolTable(types_, [&](const Type &type) {
+    return declared(type.struct_def) || declared(type.enum_def);
+  });
+  if (declared(root_struct_def_)) root_struct_def_ = nullptr;
+  EraseFromSymbolTable(structs_,
+                       [&](const StructDef &def) { return declared(&def); });
+  EraseFromSymbolTable(enums_,
+                       [&](const EnumDef &def) { return declared(&def); });
+  EraseFromSymbolTable(services_,
+                       [&](const ServiceDef &def) { return declared(&def); });
+  for (const auto &file : files) {
+    files_included_per_file_.erase(file);
+    const auto hash = file_hashes_.find(file);
+    if (hash == file_hashes_.end()) continue;
+    included_files_.erase(hash->second);
+    file_hashes_.erase(hash);
+  }
+  return true;
 }
 #endif // defined(NOS_CUSTOM_FLATBUFFERS) && NOS_CUSTOM_FLATBUFFERS  // clang-format on
 
