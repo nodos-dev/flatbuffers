@@ -1280,6 +1280,48 @@ public:
   bool CompleteMissingField(FieldDef *absent_field, const StructDef &struct_def, size_t& fieldn_outer, int32_t lastFieldCount);
   FLATBUFFERS_CHECKED_ERROR ParseDynamic(Value &val, FieldDef *field, size_t fieldn, const StructDef *struct_def_inner, const char *typeName);
 
+  // A failed Parse leaves the definitions as they were before it, so the
+  // schemas already parsed keep working and the file can be parsed again once
+  // it is fixed.
+
+  // The schema files whose definitions use those of the given files, directly
+  // or through definitions of other files. RemoveSchemaFiles removes the given
+  // files only together with these.
+  std::set<std::string> FindDependentSchemaFiles(
+      const std::set<std::string> &files) const;
+  // Removes the definitions the given schema files declared, and forgets the
+  // files so they can be parsed again. While a definition of another file uses
+  // one of them, it changes nothing and returns false.
+  bool RemoveSchemaFiles(const std::set<std::string> &files);
+
+private:
+  // What a Parse can change, to undo a failed one. Definitions it added come
+  // after the counts here.
+  struct DefinitionCheckpoint {
+    size_t types;
+    size_t structs;
+    size_t enums;
+    size_t services;
+    size_t namespaces;
+    size_t native_included_files;
+    Namespace *current_namespace;
+    StructDef *root_struct_def;
+    std::string file_identifier;
+    std::string file_extension;
+    std::map<uint64_t, std::string> included_files;
+    std::map<std::string, std::set<IncludedFile>> files_included_per_file;
+    std::map<std::string, uint64_t> file_hashes;
+    std::map<std::string, bool> known_attributes;
+    uint64_t advanced_features;
+    bool uses_flexbuffers;
+  };
+  DefinitionCheckpoint MakeCheckpoint() const;
+  void RollBack(const DefinitionCheckpoint &checkpoint);
+
+  // Each file parsed, with its key in included_files_, which RemoveSchemaFiles
+  // erases. The key hashes the contents the file had, which can change on disk.
+  std::map<std::string, uint64_t> file_hashes_;
+
 #endif // defined(NOS_CUSTOM_FLATBUFFERS) && NOS_CUSTOM_FLATBUFFERS  // clang-format on
 };
 
